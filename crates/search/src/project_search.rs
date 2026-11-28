@@ -468,7 +468,7 @@ impl ProjectSearch {
         cx: &mut Context<Self>,
     ) -> Subscription {
         cx.subscribe(excerpts, |this, _, event, cx| {
-            if matches!(event, multi_buffer::Event::FileHandleChanged) {
+            if matches!(event, multi_buffer::Event::FileHandleChanged(_)) {
                 this.remove_deleted_buffers(cx);
             }
         })

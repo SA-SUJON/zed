@@ -308,31 +308,32 @@ pub(crate) fn refresh_enabled_in_any_buffer(
     multi_buffer: &Entity<MultiBuffer>,
     cx: &Context<Editor>,
 ) {
-    editor.jsx_tag_auto_close_enabled_in_any_buffer = {
-        let multi_buffer = multi_buffer.read(cx);
-        let mut found_enabled = false;
-        multi_buffer.for_each_buffer(&mut |buffer| {
-            if found_enabled {
-                return;
-            }
+    editor.jsx_tag_auto_close_enabled_buffers.clear();
+    multi_buffer.read(cx).for_each_buffer(&mut |buffer| {
+        refresh_enabled_for_buffer(editor, buffer, cx);
+    });
+}
 
-            let buffer = buffer.read(cx);
-            let snapshot = buffer.snapshot();
-            for language in snapshot.syntax_layers_languages() {
-                if language.config().jsx_tag_auto_close.is_none() {
-                    continue;
-                }
-                let should_auto_close =
-                    LanguageSettings::resolve(Some(buffer), Some(&language.name()), cx)
-                        .jsx_tag_auto_close;
-                if should_auto_close {
-                    found_enabled = true;
-                }
-            }
-        });
-
-        found_enabled
-    };
+pub(crate) fn refresh_enabled_for_buffer(
+    editor: &mut Editor,
+    buffer: &Entity<language::Buffer>,
+    cx: &Context<Editor>,
+) {
+    let buffer = buffer.read(cx);
+    let enabled = buffer.snapshot().syntax_layers_languages().any(|language| {
+        language.config().jsx_tag_auto_close.is_some()
+            && LanguageSettings::resolve(Some(buffer), Some(&language.name()), cx)
+                .jsx_tag_auto_close
+    });
+    if enabled {
+        editor
+            .jsx_tag_auto_close_enabled_buffers
+            .insert(buffer.remote_id());
+    } else {
+        editor
+            .jsx_tag_auto_close_enabled_buffers
+            .remove(&buffer.remote_id());
+    }
 }
 
 pub(crate) type InitialBufferVersionsMap = HashMap<language::BufferId, clock::Global>;
@@ -347,7 +348,7 @@ pub(crate) fn construct_initial_buffer_versions_map<
 ) -> InitialBufferVersionsMap {
     let mut initial_buffer_versions = InitialBufferVersionsMap::default();
 
-    if !editor.jsx_tag_auto_close_enabled_in_any_buffer || edits.is_empty() {
+    if editor.jsx_tag_auto_close_enabled_buffers.is_empty() || edits.is_empty() {
         return initial_buffer_versions;
     }
 
@@ -374,7 +375,7 @@ pub(crate) fn handle_from(
     window: &mut Window,
     cx: &mut Context<Editor>,
 ) {
-    if !editor.jsx_tag_auto_close_enabled_in_any_buffer {
+    if editor.jsx_tag_auto_close_enabled_buffers.is_empty() || initial_buffer_versions.is_empty() {
         return;
     }
 
@@ -617,10 +618,14 @@ mod jsx_tag_autoclose_tests {
     };
 
     use super::*;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::{AppContext as _, TestAppContext, UpdateGlobal as _};
+    use language::{Language, LanguageConfig, LanguageRegistry};
     use languages::language;
     use multi_buffer::{MultiBufferOffset, PathKey};
+    use settings::{LocalSettingsKind, LocalSettingsPath, SettingsStore};
+    use std::{path::Path, sync::Arc};
     use text::Selection;
+    use util::rel_path::rel_path;
 
     async fn test_setup(cx: &mut TestAppContext) -> EditorTestContext {
         init_test(cx, |settings| {
@@ -786,6 +791,249 @@ mod jsx_tag_autoclose_tests {
         test_doesnt_mess_up_trailing_text,
         "<divˇfoobar" + ">" => "<div>ˇ</div>foobar"
     );
+
+    #[gpui::test]
+    async fn test_enabled_buffers_follow_multibuffer_changes(cx: &mut TestAppContext) {
+        init_test(cx, |settings| {
+            settings
+                .defaults
+                .jsx_tag_auto_close
+                .get_or_insert_default()
+                .enabled = Some(true);
+        });
+        let tsx = language("tsx", tree_sitter_typescript::LANGUAGE_TSX.into());
+        let buffer_a = cx.new(|cx| {
+            let mut buffer = language::Buffer::local("<div />", cx);
+            buffer.set_language(Some(tsx.clone()), cx);
+            buffer
+        });
+        let buffer_b = cx.new(|cx| {
+            let mut buffer = language::Buffer::local("<span />", cx);
+            buffer.set_language(Some(tsx.clone()), cx);
+            buffer
+        });
+        cx.run_until_parked();
+
+        let multibuffer = cx.new(|cx| {
+            let mut multibuffer = MultiBuffer::new(language::Capability::ReadWrite);
+            let range = language::Point::zero()..buffer_a.read(cx).max_point();
+            multibuffer.set_excerpts_for_path(PathKey::sorted(0), buffer_a.clone(), [range], 0, cx);
+            multibuffer
+        });
+        let editor = cx.add_window(|window, cx| build_editor(multibuffer, window, cx));
+        let mut cx = EditorTestContext::for_editor(editor, cx).await;
+        let (buffer_a_id, buffer_b_id) = cx.update_editor(|editor, _, cx| {
+            let buffer_a_id = buffer_a.read(cx).remote_id();
+            let buffer_b_id = buffer_b.read(cx).remote_id();
+            assert_eq!(
+                editor.jsx_tag_auto_close_enabled_buffers,
+                [buffer_a_id].into_iter().collect()
+            );
+            (buffer_a_id, buffer_b_id)
+        });
+
+        // This buffer has already parsed, so adding it need not produce a reparse event.
+        cx.update_multibuffer(|multibuffer, cx| {
+            let range = language::Point::zero()..buffer_b.read(cx).max_point();
+            multibuffer.set_excerpts_for_path(PathKey::sorted(1), buffer_b.clone(), [range], 0, cx);
+        });
+        cx.run_until_parked();
+        cx.update_editor(|editor, _, _| {
+            assert_eq!(
+                editor.jsx_tag_auto_close_enabled_buffers,
+                [buffer_a_id, buffer_b_id].into_iter().collect()
+            );
+        });
+
+        cx.update_multibuffer(|multibuffer, cx| {
+            multibuffer.remove_excerpts_for_paths(vec![PathKey::sorted(0)], cx);
+        });
+        cx.run_until_parked();
+        cx.update_editor(|editor, _, cx| {
+            assert_eq!(
+                editor.jsx_tag_auto_close_enabled_buffers,
+                [buffer_b_id].into_iter().collect()
+            );
+            buffer_b.update(cx, |buffer, cx| buffer.set_language(None, cx));
+        });
+        cx.run_until_parked();
+        cx.update_editor(|editor, _, cx| {
+            assert!(editor.jsx_tag_auto_close_enabled_buffers.is_empty());
+            buffer_b.update(cx, |buffer, cx| buffer.set_language(Some(tsx), cx));
+        });
+        cx.run_until_parked();
+        cx.update_editor(|editor, _, _| {
+            assert_eq!(
+                editor.jsx_tag_auto_close_enabled_buffers,
+                [buffer_b_id].into_iter().collect()
+            );
+        });
+
+        for enabled in [false, true] {
+            cx.update_editor(|_, _, cx| {
+                settings::SettingsStore::update_global(cx, |store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings
+                            .project
+                            .all_languages
+                            .defaults
+                            .jsx_tag_auto_close
+                            .get_or_insert_default()
+                            .enabled = Some(enabled);
+                    });
+                });
+            });
+            cx.run_until_parked();
+            cx.update_editor(|editor, _, _| {
+                assert_eq!(
+                    editor.jsx_tag_auto_close_enabled_buffers.is_empty(),
+                    !enabled
+                );
+            });
+        }
+
+        cx.update_multibuffer(|multibuffer, cx| {
+            multibuffer.remove_excerpts_for_paths(vec![PathKey::sorted(1)], cx);
+        });
+        cx.run_until_parked();
+        cx.update_editor(|editor, _, _| {
+            assert!(editor.jsx_tag_auto_close_enabled_buffers.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_enabled_buffers_follow_injected_language_settings_on_file_move(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+        let fs = project::FakeFs::new(cx.executor());
+        let root = Path::new(if cfg!(windows) {
+            "C:\\project"
+        } else {
+            "/project"
+        });
+        fs.insert_tree(
+            root,
+            serde_json::json!({
+                "enabled": {"example.html": "<script><div /></script>"},
+                "disabled": {}
+            }),
+        )
+        .await;
+        let project = project::Project::test(fs, [root], cx).await;
+        let worktree = project.update(cx, |project, cx| {
+            project.worktrees(cx).next().expect("test worktree")
+        });
+        let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            for (directory, enabled) in [("enabled", true), ("disabled", false)] {
+                let settings = serde_json::json!({
+                    "languages": {"TSX": {"jsx_tag_auto_close": {"enabled": enabled}}}
+                });
+                store
+                    .set_local_settings(
+                        worktree_id,
+                        LocalSettingsPath::InWorktree(rel_path(directory).into()),
+                        LocalSettingsKind::Settings,
+                        Some(&settings.to_string()),
+                        cx,
+                    )
+                    .expect("valid injected-language settings");
+            }
+        });
+        let file = worktree
+            .update(cx, |worktree, cx| {
+                worktree.load_file(rel_path("enabled/example.html"), cx)
+            })
+            .await
+            .expect("test file")
+            .file;
+        let html = Arc::new(
+            Language::new(
+                LanguageConfig {
+                    name: "HTML".into(),
+                    ..Default::default()
+                },
+                Some(tree_sitter_html::LANGUAGE.into()),
+            )
+            .with_injection_query(
+                r#"
+                (script_element
+                    (raw_text) @injection.content
+                    (#set! injection.language "tsx"))
+                "#,
+            )
+            .expect("valid TSX injection query"),
+        );
+        let tsx = language("tsx", tree_sitter_typescript::LANGUAGE_TSX.into());
+        let registry = Arc::new(LanguageRegistry::test(cx.executor()));
+        registry.add(html.clone());
+        registry.add(tsx.clone());
+        let buffer = cx.new(|cx| {
+            let mut buffer = language::Buffer::local("<script><div /></script>", cx);
+            buffer.file_updated(file.clone(), cx);
+            buffer.set_language_registry(registry);
+            buffer.set_language(Some(html), cx);
+            buffer
+        });
+        cx.run_until_parked();
+        let root_settings = buffer.read_with(cx, |buffer, cx| {
+            assert!(
+                buffer
+                    .snapshot()
+                    .syntax_layers_languages()
+                    .any(|language| language.name() == tsx.name())
+            );
+            LanguageSettings::resolve(Some(buffer), None, cx)
+        });
+        let multibuffer = cx.new(|cx| {
+            let mut multibuffer = MultiBuffer::new(language::Capability::ReadWrite);
+            let range = language::Point::zero()..buffer.read(cx).max_point();
+            multibuffer.set_excerpts_for_path(PathKey::sorted(0), buffer.clone(), [range], 0, cx);
+            multibuffer
+        });
+        let editor = cx.add_window(|window, cx| build_editor(multibuffer, window, cx));
+        cx.run_until_parked();
+        let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+        let mut cx = EditorTestContext::for_editor(editor, cx).await;
+        cx.update_editor(|editor, _, _| {
+            assert!(
+                editor
+                    .jsx_tag_auto_close_enabled_buffers
+                    .contains(&buffer_id)
+            );
+        });
+
+        for (path, enabled) in [
+            ("disabled/example.html", false),
+            ("enabled/example.html", true),
+        ] {
+            let mut moved_file = (*file).clone();
+            moved_file.path = rel_path(path).into();
+            buffer.update(&mut cx.cx, |buffer, cx| {
+                buffer.file_updated(Arc::new(moved_file), cx);
+            });
+            cx.run_until_parked();
+            cx.update_editor(|editor, _, cx| {
+                let buffer = buffer.read(cx);
+                assert_eq!(
+                    LanguageSettings::resolve(Some(buffer), None, cx),
+                    root_settings
+                );
+                assert_eq!(
+                    LanguageSettings::resolve(Some(buffer), Some(&tsx.name()), cx)
+                        .jsx_tag_auto_close,
+                    enabled
+                );
+                assert_eq!(
+                    editor
+                        .jsx_tag_auto_close_enabled_buffers
+                        .contains(&buffer_id),
+                    enabled
+                );
+            });
+        }
+    }
 
     #[gpui::test]
     async fn test_multibuffer(cx: &mut TestAppContext) {

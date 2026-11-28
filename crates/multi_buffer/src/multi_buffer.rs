@@ -121,10 +121,10 @@ pub enum Event {
     Reloaded,
     CapabilityChanged,
     LanguageChanged(BufferId, bool),
-    SettingsChanged,
+    SettingsChanged(BufferId),
     Reparsed(BufferId),
     Saved,
-    FileHandleChanged,
+    FileHandleChanged(BufferId),
     DirtyChanged,
     DiagnosticsUpdated,
     BufferDiffChanged,
@@ -2077,12 +2077,12 @@ impl MultiBuffer {
             },
             BufferEvent::DirtyChanged => Event::DirtyChanged,
             BufferEvent::Saved => Event::Saved,
-            BufferEvent::FileHandleChanged => Event::FileHandleChanged,
+            BufferEvent::FileHandleChanged => Event::FileHandleChanged(buffer_id),
             BufferEvent::Reloaded => Event::Reloaded,
             BufferEvent::LanguageChanged(has_language) => {
                 Event::LanguageChanged(buffer_id, *has_language)
             }
-            BufferEvent::SettingsChanged => Event::SettingsChanged,
+            BufferEvent::SettingsChanged => Event::SettingsChanged(buffer_id),
             BufferEvent::Reparsed => Event::Reparsed(buffer_id),
             BufferEvent::DiagnosticsUpdated => Event::DiagnosticsUpdated,
             BufferEvent::CapabilityChanged => {

@@ -1127,7 +1127,7 @@ pub struct Editor {
     use_auto_surround: bool,
     use_selection_highlight: bool,
     auto_replace_emoji_shortcode: bool,
-    jsx_tag_auto_close_enabled_in_any_buffer: bool,
+    jsx_tag_auto_close_enabled_buffers: HashSet<BufferId>,
     show_git_blame_gutter: bool,
     show_git_blame_inline: bool,
     show_git_blame_inline_delay_task: Option<Task<()>>,
@@ -2482,7 +2482,7 @@ impl Editor {
             use_auto_surround: true,
             use_selection_highlight: true,
             auto_replace_emoji_shortcode: false,
-            jsx_tag_auto_close_enabled_in_any_buffer: false,
+            jsx_tag_auto_close_enabled_buffers: HashSet::default(),
             leader_id: None,
             remote_id: None,
             hover_state: HoverState::default(),
@@ -10181,6 +10181,7 @@ impl Editor {
                 ranges,
                 path_key,
             } => {
+                jsx_tag_auto_close::refresh_enabled_for_buffer(self, buffer, cx);
                 if let Some(hovered_link_state) = self.hovered_link_state.as_mut() {
                     hovered_link_state.symbol_range = None;
                 }
@@ -10219,6 +10220,7 @@ impl Editor {
                     cx,
                 );
                 for buffer_id in removed_buffer_ids {
+                    self.jsx_tag_auto_close_enabled_buffers.remove(buffer_id);
                     self.registered_buffers.remove(buffer_id);
                     self.clear_runnables(Some(*buffer_id));
                     self.semantic_token_state.invalidate_buffer(buffer_id);
@@ -10235,7 +10237,6 @@ impl Editor {
                 });
                 self.inlay_hint_visibility_changed(cx);
 
-                jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
                 cx.emit(EditorEvent::BuffersRemoved {
                     removed_buffer_ids: removed_buffer_ids.clone(),
                 });
@@ -10253,7 +10254,9 @@ impl Editor {
                 self.refresh_runnables(Some(*buffer_id), window, cx);
                 self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
                 self.colorize_brackets(true, cx);
-                jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
+                if let Some(buffer) = multibuffer.read(cx).buffer(*buffer_id) {
+                    jsx_tag_auto_close::refresh_enabled_for_buffer(self, &buffer, cx);
+                }
 
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
             }
@@ -10276,12 +10279,17 @@ impl Editor {
                     self.refresh_inlay_hints(InlayHintRefreshReason::ServerRemoved, cx);
                     self.refresh_document_highlights(cx);
                 }
-                jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
+                if let Some(buffer) = multibuffer.read(cx).buffer(*buffer_id) {
+                    jsx_tag_auto_close::refresh_enabled_for_buffer(self, &buffer, cx);
+                }
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
                 self.update_edit_prediction_settings(cx);
                 cx.notify();
             }
-            multi_buffer::Event::SettingsChanged => {
+            multi_buffer::Event::SettingsChanged(buffer_id) => {
+                if let Some(buffer) = multibuffer.read(cx).buffer(*buffer_id) {
+                    jsx_tag_auto_close::refresh_enabled_for_buffer(self, &buffer, cx);
+                }
                 let new_language_settings = self.fetch_applicable_language_settings(cx);
                 if new_language_settings != self.applicable_language_settings {
                     self.applicable_language_settings = new_language_settings;
@@ -10290,7 +10298,11 @@ impl Editor {
             }
             multi_buffer::Event::DirtyChanged => cx.emit(EditorEvent::DirtyChanged),
             multi_buffer::Event::Saved => cx.emit(EditorEvent::Saved),
-            multi_buffer::Event::FileHandleChanged => {
+            multi_buffer::Event::FileHandleChanged(buffer_id) => {
+                if let Some(buffer) = self.buffer.read(cx).buffer(*buffer_id) {
+                    jsx_tag_auto_close::refresh_enabled_for_buffer(self, &buffer, cx);
+                }
+
                 cx.emit(EditorEvent::TitleChanged);
                 cx.emit(EditorEvent::FileHandleChanged);
             }
@@ -10380,6 +10392,7 @@ impl Editor {
     }
 
     fn settings_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, &self.buffer.clone(), cx);
         let new_language_settings = self.fetch_applicable_language_settings(cx);
         let language_settings_changed = new_language_settings != self.applicable_language_settings;
         self.applicable_language_settings = new_language_settings;
